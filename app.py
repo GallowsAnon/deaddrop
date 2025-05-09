@@ -1,7 +1,7 @@
 from functools import wraps
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 from flask_login import login_user, logout_user, login_required, current_user
-from models import User, BotSettings, AISettings, init_db, URLWatcherSettings, Module
+from models import User, BotSettings, AISettings, init_db, URLWatcherSettings, Module, ChannelManagementSettings
 from irc_bouncer import IRCBouncer, Channel
 from extensions import app, db, socketio, login_manager
 from flask_socketio import emit, join_room, leave_room
@@ -701,6 +701,55 @@ Generate a Python module for an IRC bot that: {description}"""
 def module_template():
     with open('templates/module_template.py', 'r') as f:
         return f.read()
+
+@app.route('/channel_management')
+@login_required
+@admin_required
+def channel_management():
+    settings = BotSettings.query.first()
+    channels = settings.channels.split(',') if settings and settings.channels else []
+    
+    # Get or create settings for each channel
+    channel_settings = {}
+    for channel in channels:
+        channel = channel.strip()
+        settings = ChannelManagementSettings.query.filter_by(channel=channel).first()
+        if not settings:
+            settings = ChannelManagementSettings(channel=channel)
+            db.session.add(settings)
+            db.session.commit()
+        channel_settings[channel] = settings
+    
+    return render_template('channel_management.html', channel_settings=channel_settings)
+
+@app.route('/channel_management/update', methods=['POST'])
+@login_required
+@admin_required
+def update_channel_management():
+    channel = request.form.get('channel')
+    is_enabled = request.form.get('is_enabled') == 'true'
+    flood_threshold = int(request.form.get('flood_threshold', 8))
+    flood_timeframe = int(request.form.get('flood_timeframe', 60))
+    caps_percentage = int(request.form.get('caps_percentage', 70))
+    
+    settings = ChannelManagementSettings.query.filter_by(channel=channel).first()
+    if not settings:
+        settings = ChannelManagementSettings(channel=channel)
+        db.session.add(settings)
+    
+    settings.is_enabled = is_enabled
+    settings.flood_threshold = flood_threshold
+    settings.flood_timeframe = flood_timeframe
+    settings.caps_percentage = caps_percentage
+    
+    db.session.commit()
+    
+    # Reload settings in the bot
+    global irc_bot
+    if irc_bot:
+        irc_bot.reload_channel_settings()
+    
+    return jsonify({'success': True})
 
 if __name__ == '__main__':
     import sys

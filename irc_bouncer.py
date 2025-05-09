@@ -5,12 +5,13 @@ import threading
 import time
 import logging
 import openai
-from models import BotSettings, AISettings
+from models import BotSettings, AISettings, ChannelManagementSettings
 from extensions import app, db, socketio
 from datetime import datetime, timedelta
 from url_watcher import URLWatcher
 from module_loader import ModuleLoader
 from ai_utils import get_ai_response
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,9 @@ class IRCBouncer(irc.bot.SingleServerIRCBot):
         self.topics = {}  # {channel: topic}
         self.url_watcher = URLWatcher(self)
         self.module_loader = ModuleLoader(self)  # Initialize module loader
+        self.message_history = {}  # Store message history for flood detection
+        self.channel_settings = {}  # Store channel management settings
+        self.load_channel_settings()
         
         logger.info(f"Initializing IRC bot with server={server}, port={port}, nick={nick}, ssl={use_ssl}")
         
@@ -165,11 +169,38 @@ class IRCBouncer(irc.bot.SingleServerIRCBot):
         logger.info(f"Requesting TOPIC for {channel}")
         connection.topic(channel)
 
+    def kick(self, connection, channel, nick, reason):
+        """Kick a user from a channel with a reason."""
+        try:
+            connection.kick(channel, nick, reason)
+            logger.info(f"Kicked {nick} from {channel}: {reason}")
+            # Emit system message to webchat
+            socketio.emit('webchat_message', {
+                'nick': '',
+                'message': f'* {nick} has been kicked: {reason}',
+                'timestamp': datetime.now().strftime('%H:%M:%S')
+            }, room=channel)
+        except Exception as e:
+            logger.error(f"Failed to kick {nick} from {channel}: {e}")
+
     def on_pubmsg(self, connection, event):
         """Handle public messages."""
         channel = event.target
         nick = event.source.nick
         message = event.arguments[0]
+        
+        # Reload settings before checking
+        self.reload_channel_settings()
+        
+        # Check for flood
+        if self.check_flood(channel, nick):
+            self.kick(connection, channel, nick, "Flooding detected")
+            return
+        
+        # Check for caps
+        if self.check_caps(channel, message):
+            self.kick(connection, channel, nick, "Excessive caps usage")
+            return
         
         logger.info(f"Received message in {channel} from {nick}: {message}")
         
@@ -183,6 +214,7 @@ class IRCBouncer(irc.bot.SingleServerIRCBot):
             'message': message,
             'timestamp': datetime.now().strftime('%H:%M:%S')
         })
+        
         # Limit history to last 100 messages
         if len(self.webchat_messages[channel]) > 100:
             self.webchat_messages[channel] = self.webchat_messages[channel][-100:]
@@ -348,6 +380,9 @@ class IRCBouncer(irc.bot.SingleServerIRCBot):
         if channel in self.webchat_channels and nick:
             logger.info(f"Removing user {nick} from channel {channel}")
             self.webchat_channels[channel].remove_user(nick)
+            # Clear message history for this user in this channel
+            if channel in self.message_history and nick in self.message_history[channel]:
+                del self.message_history[channel][nick]
             # Broadcast updated userlist
             socketio.emit('webchat_users', {
                 'users': self.webchat_channels[channel].get_users()
@@ -499,4 +534,345 @@ class IRCBouncer(irc.bot.SingleServerIRCBot):
             return False 
 
     def now_str(self):
-        return datetime.now().strftime('%H:%M:%S') 
+        return datetime.now().strftime('%H:%M:%S')
+
+    def load_channel_settings(self):
+        """Load channel management settings from database."""
+        with app.app_context():
+            settings = ChannelManagementSettings.query.all()
+            for setting in settings:
+                self.channel_settings[setting.channel] = {
+                    'is_enabled': setting.is_enabled,
+                    'flood_threshold': setting.flood_threshold,
+                    'flood_timeframe': setting.flood_timeframe,
+                    'caps_percentage': setting.caps_percentage
+                }
+            logger.info(f"Loaded channel settings: {self.channel_settings}")
+
+    def reload_channel_settings(self):
+        """Reload channel management settings from database."""
+        self.channel_settings.clear()  # Clear existing settings
+        with app.app_context():
+            settings = ChannelManagementSettings.query.all()
+            for setting in settings:
+                self.channel_settings[setting.channel] = {
+                    'is_enabled': setting.is_enabled,
+                    'flood_threshold': setting.flood_threshold,
+                    'flood_timeframe': setting.flood_timeframe,
+                    'caps_percentage': setting.caps_percentage
+                }
+            logger.info(f"Reloaded channel settings: {self.channel_settings}")
+
+    def check_flood(self, channel, nick):
+        """Check if a user is flooding in a channel."""
+        if not self.channel_settings.get(channel, {}).get('is_enabled', False):
+            return False
+
+        settings = self.channel_settings[channel]
+        threshold = settings.get('flood_threshold', 5)
+        timeframe = settings.get('flood_timeframe', 10)
+
+        # Initialize message history for this channel if not exists
+        if channel not in self.message_history:
+            self.message_history[channel] = {}
+
+        # Initialize message history for this user if not exists
+        if nick not in self.message_history[channel]:
+            self.message_history[channel][nick] = []
+
+        # Add current message timestamp
+        current_time = datetime.now()
+        self.message_history[channel][nick].append(current_time)
+
+        # Remove messages outside the timeframe
+        cutoff_time = current_time - timedelta(seconds=timeframe)
+        self.message_history[channel][nick] = [
+            t for t in self.message_history[channel][nick]
+            if t > cutoff_time
+        ]
+
+        # Check if user has exceeded the threshold
+        if len(self.message_history[channel][nick]) > threshold:
+            logger.warning(f"Flood detected from {nick} in {channel}")
+            return True
+
+        return False
+
+    def check_caps(self, channel, message):
+        """Check if a message contains excessive caps."""
+        if not self.channel_settings.get(channel, {}).get('is_enabled', False):
+            return False
+
+        settings = self.channel_settings[channel]
+        caps_percentage = settings.get('caps_percentage', 70)
+
+        # Count uppercase letters
+        caps_count = sum(1 for c in message if c.isupper())
+        total_letters = sum(1 for c in message if c.isalpha())
+
+        # Skip if no letters or if message is too short
+        if total_letters < 5:
+            return False
+
+        # Calculate percentage of caps
+        caps_ratio = (caps_count / total_letters) * 100
+
+        if caps_ratio > caps_percentage:
+            logger.warning(f"Excessive caps detected in {channel}: {caps_ratio}%")
+            return True
+
+        return False
+
+    def on_kick(self, connection, event):
+        """Called when a user is kicked from a channel."""
+        channel = event.target
+        kicked_nick = event.arguments[0]
+        reason = event.arguments[1] if len(event.arguments) > 1 else "No reason given"
+        kicker = event.source.nick
+        
+        logger.info(f"Kick event in {channel}: {kicker} kicked {kicked_nick}: {reason}")
+        
+        if channel in self.webchat_channels:
+            # Remove user from channel
+            self.webchat_channels[channel].remove_user(kicked_nick)
+            # Clear message history for this user in this channel
+            if channel in self.message_history and kicked_nick in self.message_history[channel]:
+                del self.message_history[channel][kicked_nick]
+            # Broadcast updated userlist
+            socketio.emit('webchat_users', {
+                'users': self.webchat_channels[channel].get_users()
+            }, room=channel)
+            # Emit system kick message
+            socketio.emit('webchat_message', {
+                'nick': '',
+                'message': f'* {kicked_nick} was kicked by {kicker}: {reason}',
+                'timestamp': datetime.now().strftime('%H:%M:%S')
+            }, room=channel)
+
+    def on_mode(self, connection, event):
+        """Called when channel modes are changed."""
+        channel = event.target
+        modes = event.arguments[0]
+        args = event.arguments[1:]
+        source = event.source.nick
+        
+        logger.info(f"Mode change in {channel} by {source}: {modes} {args}")
+        
+        # Handle ban modes (+b/-b)
+        if 'b' in modes:
+            mode_type = modes[0]  # + or -
+            if mode_type == '+':
+                # Ban added
+                ban_mask = args[0]
+                socketio.emit('webchat_message', {
+                    'nick': '',
+                    'message': f'* {source} banned {ban_mask}',
+                    'timestamp': datetime.now().strftime('%H:%M:%S')
+                }, room=channel)
+            else:
+                # Ban removed
+                ban_mask = args[0]
+                socketio.emit('webchat_message', {
+                    'nick': '',
+                    'message': f'* {source} unbanned {ban_mask}',
+                    'timestamp': datetime.now().strftime('%H:%M:%S')
+                }, room=channel)
+
+    def on_ban(self, connection, event):
+        """Called when a user is banned from a channel."""
+        channel = event.target
+        ban_mask = event.arguments[0]
+        banner = event.source.nick
+        
+        logger.info(f"Ban event in {channel}: {banner} banned {ban_mask}")
+        
+        # Check if the banned user is in our channel
+        if channel in self.webchat_channels:
+            # Try to match the ban mask to a user in the channel
+            for nick in list(self.webchat_channels[channel].users.keys()):
+                if self._match_ban_mask(nick, ban_mask):
+                    # Remove user from channel
+                    self.webchat_channels[channel].remove_user(nick)
+                    # Broadcast updated userlist
+                    socketio.emit('webchat_users', {
+                        'users': self.webchat_channels[channel].get_users()
+                    }, room=channel)
+                    # Emit system ban message
+                    socketio.emit('webchat_message', {
+                        'nick': '',
+                        'message': f'* {nick} was banned by {banner}',
+                        'timestamp': datetime.now().strftime('%H:%M:%S')
+                    }, room=channel)
+
+    def _match_ban_mask(self, nick, ban_mask):
+        """Check if a nickname matches a ban mask."""
+        # Convert ban mask to regex pattern
+        pattern = ban_mask.replace('*', '.*').replace('?', '.')
+        try:
+            return bool(re.match(pattern, nick, re.IGNORECASE))
+        except re.error:
+            return False
+
+    def on_quit(self, connection, event):
+        """Called when a user quits the server."""
+        nick = event.source.nick
+        reason = event.arguments[0] if event.arguments else "No reason given"
+        
+        logger.info(f"Quit event: {nick} quit: {reason}")
+        
+        # Remove user from all channels
+        for channel in self.webchat_channels.values():
+            if nick in channel.users:
+                channel.remove_user(nick)
+                # Clear message history for this user in this channel
+                if channel.name in self.message_history and nick in self.message_history[channel.name]:
+                    del self.message_history[channel.name][nick]
+                # Broadcast updated userlist
+                socketio.emit('webchat_users', {
+                    'users': channel.get_users()
+                }, room=channel.name)
+                # Emit system quit message
+                socketio.emit('webchat_message', {
+                    'nick': '',
+                    'message': f'* {nick} has quit: {reason}',
+                    'timestamp': datetime.now().strftime('%H:%M:%S')
+                }, room=channel.name)
+
+    def on_nick(self, connection, event):
+        """Called when a user changes their nickname."""
+        old_nick = event.source.nick
+        # Use event.arguments[0] if present, else event.target (for nick changes)
+        new_nick = event.arguments[0] if event.arguments else event.target
+
+        if not new_nick:
+            logger.error("Nick change event missing new nickname (arguments and target both empty)")
+            return
+
+        logger.info(f"Nick change: {old_nick} -> {new_nick}")
+
+        for channel in self.webchat_channels.values():
+            if old_nick in channel.users:
+                mode = channel.users[old_nick]
+                channel.remove_user(old_nick)
+                channel.add_user(new_nick, mode)
+                # Emit system nick change message
+                socketio.emit('webchat_message', {
+                    'nick': '',
+                    'message': f'* {old_nick} is now known as {new_nick}',
+                    'timestamp': datetime.now().strftime('%H:%M:%S')
+                }, room=channel.name)
+
+        # If the bot's nickname changed, update it
+        if old_nick == self.nick:
+            self.nick = new_nick
+            logger.info(f"Bot's nickname changed to {new_nick}")
+
+        # Force userlist refresh for all channels
+        self.emit_all_userlists()
+        logger.info(f"Userlist refreshed after nick change: {old_nick} -> {new_nick}")
+
+    def emit_all_userlists(self):
+        for channel in self.webchat_channels.values():
+            socketio.emit('webchat_users', {
+                'users': channel.get_users()
+            }, room=channel.name)
+
+    def on_glined(self, connection, event):
+        """Called when a user is G-lined (global ban)."""
+        user = event.arguments[0]
+        reason = event.arguments[1] if len(event.arguments) > 1 else "No reason given"
+        
+        logger.info(f"G-line event: {user} was G-lined: {reason}")
+        
+        # Remove user from all channels
+        for channel in self.webchat_channels.values():
+            if user in channel.users:
+                channel.remove_user(user)
+                # Broadcast updated userlist
+                socketio.emit('webchat_users', {
+                    'users': channel.get_users()
+                }, room=channel.name)
+                # Emit system G-line message
+                socketio.emit('webchat_message', {
+                    'nick': '',
+                    'message': f'* {user} was G-lined: {reason}',
+                    'timestamp': datetime.now().strftime('%H:%M:%S')
+                }, room=channel.name)
+
+    def on_zlined(self, connection, event):
+        """Called when a user is Z-lined (IP ban)."""
+        ip = event.arguments[0]
+        reason = event.arguments[1] if len(event.arguments) > 1 else "No reason given"
+        
+        logger.info(f"Z-line event: {ip} was Z-lined: {reason}")
+        
+        # Note: We can't directly match IPs to users, but we can notify channels
+        for channel in self.webchat_channels.values():
+            socketio.emit('webchat_message', {
+                'nick': '',
+                'message': f'* IP {ip} was Z-lined: {reason}',
+                'timestamp': datetime.now().strftime('%H:%M:%S')
+            }, room=channel.name)
+
+    def on_klined(self, connection, event):
+        """Called when a user is K-lined (server ban)."""
+        user = event.arguments[0]
+        reason = event.arguments[1] if len(event.arguments) > 1 else "No reason given"
+        
+        logger.info(f"K-line event: {user} was K-lined: {reason}")
+        
+        # Remove user from all channels
+        for channel in self.webchat_channels.values():
+            if user in channel.users:
+                channel.remove_user(user)
+                # Broadcast updated userlist
+                socketio.emit('webchat_users', {
+                    'users': channel.get_users()
+                }, room=channel.name)
+                # Emit system K-line message
+                socketio.emit('webchat_message', {
+                    'nick': '',
+                    'message': f'* {user} was K-lined: {reason}',
+                    'timestamp': datetime.now().strftime('%H:%M:%S')
+                }, room=channel.name)
+
+    def on_invite(self, connection, event):
+        """Called when a user is invited to a channel."""
+        invited_nick = event.arguments[0] if event.arguments else None
+        channel = event.target if hasattr(event, 'target') else None
+        inviter = event.source.nick if hasattr(event.source, 'nick') else str(event.source)
+        logger.info(f"Invite event: {inviter} invited {invited_nick} to {channel}")
+        if channel:
+            socketio.emit('webchat_message', {
+                'nick': '',
+                'message': f'* {inviter} invited {invited_nick} into {channel}',
+                'timestamp': datetime.now().strftime('%H:%M:%S')
+            }, room=channel)
+
+    def on_ctcp(self, connection, event):
+        """Handle CTCP events, including ACTION (/me)."""
+        if event.arguments and event.arguments[0].upper() == 'ACTION':
+            channel = event.target
+            nick = event.source.nick
+            action_message = event.arguments[1] if len(event.arguments) > 1 else ''
+            logger.info(f"CTCP ACTION in {channel} from {nick}: {action_message}")
+            # Emit as a system message in webchat
+            socketio.emit('webchat_message', {
+                'nick': '',
+                'message': f'* {nick} {action_message}',
+                'timestamp': datetime.now().strftime('%H:%M:%S')
+            }, room=channel)
+
+    def on_pubnotice(self, connection, event):
+        """Handle public notices, including invite messages."""
+        channel = event.target
+        message = event.arguments[0] if event.arguments else ''
+        logger.info(f"PubNotice in {channel}: {message}")
+        # Look for invite pattern
+        if 'invited' in message and 'into the channel' in message:
+            # Example: '*** TheGrimPody invited Ponysauce into the channel'
+            socketio.emit('webchat_message', {
+                'nick': '',
+                'message': message.strip('* '),
+                'timestamp': datetime.now().strftime('%H:%M:%S')
+            }, room=channel) 

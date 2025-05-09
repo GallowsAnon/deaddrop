@@ -53,6 +53,19 @@ class Module(db.Model):
     def __repr__(self):
         return f'<Module {self.name}>'
 
+class ChannelManagementSettings(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    channel = db.Column(db.String(100), nullable=False)
+    is_enabled = db.Column(db.Boolean, default=True)
+    flood_threshold = db.Column(db.Integer, default=8)  # Number of messages
+    flood_timeframe = db.Column(db.Integer, default=60)  # Time in seconds
+    caps_percentage = db.Column(db.Integer, default=70)  # Percentage of caps to trigger kick
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def __repr__(self):
+        return f'<ChannelManagementSettings {self.channel}>'
+
 def init_db():
     db.create_all()
     
