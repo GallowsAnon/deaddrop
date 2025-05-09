@@ -8,7 +8,7 @@ A powerful IRC bot and web management solution that combines advanced IRC functi
 
 ### IRC Bot Capabilities
 - **Bouncer Functionality**: Seamlessly maintain connections and message history
-- **NickServ Integration**: Automatic identification and registration
+- **NickServ Integration**: Automatic identification and registration, may need alterations for other networks. This will be tested in future builds.
 - **Channel Management**: Auto-join channels and maintain presence
 - **Message Handling**: Process and respond to various IRC commands
 - **Custom Commands**: Extensible command system for custom functionality
