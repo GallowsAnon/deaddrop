@@ -117,7 +117,7 @@ A powerful IRC bot and web management solution that combines advanced IRC functi
 - Module Management
 - AI Response Settings
 
-![Configuration Panel](https://i.imgur.com/AxoKemt.png)
+![Configuration Panel](https://i.imgur.com/92PliU9.png)
 
 ## 🛠️ Project Structure
 
