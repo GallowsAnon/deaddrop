@@ -66,7 +66,7 @@ A powerful IRC bot and web management solution that combines advanced IRC functi
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/deaddrop-bot.git
+   git clone https://github.com/GallowsAnon/deaddrop.git
    cd deaddrop-bot
    ```
 
