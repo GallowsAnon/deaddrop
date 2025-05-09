@@ -653,7 +653,8 @@ def generate_module():
    - nick: The nickname of the user who sent the message
    - message: The message content
 
-5. To send messages, use connection.privmsg(channel, message)
+5. To send messages, ALWAYS use self.bot.send_message(connection, channel, message) instead of connection.privmsg().
+   This ensures messages appear in both IRC and the webchat interface.
 
 6. Important notes about command handling:
    - The module loader automatically strips command prefixes (!@#) from commands
@@ -696,7 +697,8 @@ Keep the code concise and focused on the described functionality."""},
    - nick: The nickname of the user who sent the message
    - message: The message content
 
-5. To send messages, use connection.privmsg(channel, message)
+5. To send messages, ALWAYS use self.bot.send_message(connection, channel, message) instead of connection.privmsg().
+   This ensures messages appear in both IRC and the webchat interface.
 
 6. Important notes about command handling:
    - The module loader automatically strips command prefixes (!@#) from commands
