@@ -546,6 +546,11 @@ def create_module():
     )
     db.session.add(module)
     db.session.commit()
+    
+    # Reload modules after creating a new one
+    if irc_bot and hasattr(irc_bot, 'module_loader'):
+        irc_bot.module_loader.load_modules()
+    
     return jsonify({'success': True})
 
 @app.route('/modules/<int:id>', methods=['GET'])
@@ -570,6 +575,11 @@ def update_module(id):
     module.trigger = data['trigger']
     module.code = data['code']
     db.session.commit()
+    
+    # Reload modules after updating
+    if irc_bot and hasattr(irc_bot, 'module_loader'):
+        irc_bot.module_loader.load_modules()
+    
     return jsonify({'success': True})
 
 @app.route('/modules/<int:id>', methods=['DELETE'])
@@ -579,6 +589,11 @@ def delete_module(id):
     module = Module.query.get_or_404(id)
     db.session.delete(module)
     db.session.commit()
+    
+    # Reload modules after deletion
+    if irc_bot and hasattr(irc_bot, 'module_loader'):
+        irc_bot.module_loader.load_modules()
+    
     return jsonify({'success': True})
 
 @app.route('/modules/<int:id>/toggle', methods=['POST'])
@@ -588,6 +603,11 @@ def toggle_module(id):
     module = Module.query.get_or_404(id)
     module.is_enabled = not module.is_enabled
     db.session.commit()
+    
+    # Reload modules after toggling
+    if irc_bot and hasattr(irc_bot, 'module_loader'):
+        irc_bot.module_loader.load_modules()
+    
     return jsonify({'success': True})
 
 @app.route('/modules/generate', methods=['POST'])
